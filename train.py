@@ -3,6 +3,7 @@ import argparse
 import torch.distributed as dist
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
+import torch
 
 import test  # import test.py to get mAP after each epoch
 from models import *
@@ -40,6 +41,7 @@ hyp = {'giou': 3.31,  # giou loss gain
        'scale': 0.11,  # image scale (+/- gain)
        'shear': 0.384}  # image shear (+/- deg)
 
+
 # Overwrite hyp with hyp*.txt (optional)
 f = glob.glob('hyp*.txt')
 if f:
@@ -48,6 +50,13 @@ if f:
 
 
 def train():
+
+    # Parse sample dataset
+    sample_dir = opt.samples
+    sample_dataset = LoadImages(sample_dir, img_size=opt.img_size, half=False)
+    if sample_dir: 
+        save_img = True
+
     cfg = opt.cfg
     data = opt.data
     img_size = opt.img_size
@@ -313,12 +322,16 @@ def train():
                                               batch_size=batch_size,
                                               img_size=opt.img_size,
                                               model=model,
-                                              conf_thres=0.001 if final_epoch and epoch > 0 else 0.1,  # 0.1 for speed
+                                              conf_thres=0.1,  # 0.1 for speed
                                               save_json=final_epoch and epoch > 0 and 'coco.data' in data)
 
         # Write epoch results
         with open(results_file, 'a') as f:
+            print('Writing to results file {}'.format(results_file))
             f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+
+        # Overwrite results plot
+        plot_results()  # save as results.png
 
         # Write Tensorboard results
         if tb_writer:
@@ -361,6 +374,13 @@ def train():
             # Delete checkpoint
             del chkpt
 
+
+        # Detect on some sample images
+        if sample_dir: 
+            run_inference(sample_dataset, model)
+
+        
+
         # end epoch ----------------------------------------------------------------------------------------------------
 
     # end training
@@ -388,6 +408,67 @@ def prebias():
         opt.weights = wdir + 'backbone.pt'  # assign backbone
         opt.prebias = False  # disable prebias
 
+def run_inference(dataset, model):
+    # Run inference
+
+    classes = load_classes(parse_data_cfg(opt.data)['names'])
+    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(classes))]
+    save_img = True
+    save_txt = True
+    t0 = time.time()
+    for path, img, im0s, vid_cap in dataset:
+        t = time.time()
+
+        # Get detections
+        img = torch.from_numpy(img).to(device)
+        if img.ndimension() == 3:
+            img = img.unsqueeze(0)
+        pred = model(img)[0]
+
+        # if opt.half:
+        #     pred = pred.float()
+
+        # Apply NMS
+        pred = non_max_suppression(pred, 0.5, 0.5)
+
+        # # Apply
+        # if classify:
+        #     pred = apply_classifier(pred, modelc, img, im0s)
+
+        # Process detections
+        for i, det in enumerate(pred):  # detections per image
+            # if webcam:  # batch_size >= 1
+            #     p, s, im0 = path[i], '%g: ' % i, im0s[i]
+            # else:
+            p, s, im0 = path, '', im0s
+
+            save_path = str(Path(opt.output) / Path(p).name)
+            s += '%gx%g ' % img.shape[2:]  # print string
+            if det is not None and len(det):
+                # Rescale boxes from img_size to im0 size
+                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+                # Print results
+                for c in det[:, -1].unique():
+                    n = (det[:, -1] == c).sum()  # detections per class
+                    s += '%g %ss, ' % (n, classes[int(c)])  # add to string
+
+                # Write results
+                for *xyxy, conf, _, cls in det:
+                    if save_txt:  # Write to file
+                        with open(save_path + '.txt', 'a') as file:
+                            file.write(('%g ' * 6 + '\n') % (*xyxy, cls, conf))
+
+                    if save_img:  # Add bbox to image
+                        label = '%s %.2f' % (classes[int(cls)], conf)
+                        plot_one_box(xyxy, im0, label=label, color=colors[int(cls)])
+
+            print('%sDone. (%.3fs)' % (s, time.time() - t))
+
+            # Save results (image with detections)
+            if save_img:
+                cv2.imwrite(save_path, im0)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -414,6 +495,9 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
     parser.add_argument('--adam', action='store_true', help='use adam optimizer')
     parser.add_argument('--var', type=float, help='debug variable')
+    parser.add_argument('--samples', type=str, default='data/samples', help='run network on images in samples after each epoch')
+    parser.add_argument('--output', type=str, default='output', help='output folder for sample detections')  # output folder
+
     opt = parser.parse_args()
     opt.weights = last if opt.resume else opt.weights
     print(opt)
